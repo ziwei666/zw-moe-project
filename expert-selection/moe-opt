@@ -1,0 +1,442 @@
+from transformers import OlmoeForCausalLM, AutoTokenizer
+
+import torch
+
+import os
+
+import numpy
+
+from collections import defaultdict
+
+import time
+
+import torch.nn as nn
+
+import torch.nn.functional as F
+
+import json
+
+
+
+#os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+DEVICE = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+class RoutingScoreCapturer:
+
+  def __init__(self, model):
+
+    self.final_results = {}
+
+    self.x = 0
+
+    self.model = model
+
+    for layer in model.model.layers:
+
+      layer.mlp.gate.register_forward_hook(self.capture_routing_scores_callback)
+
+
+
+  def capture_routing_scores_callback(self, module, input, output):
+
+    scores = F.softmax(output, dim=1, dtype=torch.float)
+
+    activation_counts = defaultdict(int)
+
+    if self.x >= 16:
+
+      i = (self.x%16)
+
+      if self.x < 32:
+
+        activation_counts = [0]*64
+
+      else:
+
+        activation_counts = self.final_results[i][1]
+
+      routing_score = scores[0].detach().cpu().numpy()
+
+      top_8_indices = sorted(range(len(routing_score)), key=lambda i: routing_score[i], reverse=True)[:8]
+
+      for idx in top_8_indices:
+
+        activation_counts[idx] += 1
+
+
+
+      if self.x < 32:
+
+        self.final_results[i] = ([routing_score], activation_counts)
+
+      else:
+
+        pre_score = self.final_results[i][0]
+
+        pre_score.append(routing_score)
+
+        self.final_results[i] = (pre_score, activation_counts)
+
+      
+
+    self.x += 1
+
+
+
+  def capture_routing_scores(self, inputs):
+
+    self.x = 0
+
+    self.final_results = {}
+
+
+
+    with torch.no_grad():
+
+      out = self.model.generate(inputs, max_length=512)
+
+      tokenizer = AutoTokenizer.from_pretrained("moe-OLMoE")
+
+      print("Ori_model>>>", tokenizer.decode(out[0]))
+
+
+
+    return self.final_results
+
+
+
+# Load different ckpts via passing e.g. `revision=step10000-tokens41B`
+
+# also check allenai/OLMoE-1B-7B-0924-SFT & allenai/OLMoE-1B-7B-0924-Instruct
+
+model = OlmoeForCausalLM.from_pretrained("moe-OLMoE", torch_dtype = torch.float16).to(DEVICE)
+
+tokenizer = AutoTokenizer.from_pretrained("moe-OLMoE")
+
+
+
+prompts = [
+
+  "Write a Python class which can save numbers and get numbers. \n Only give me the codes. Don't add any other explanations.",
+
+  "Implement quick Sort in python. Only give me the codes.",
+
+  "Implement Binary search in python. Only give me the codes."
+
+]
+
+
+
+alpha = 1
+
+beta = 1
+
+
+
+avg_importance_scores = {t: {e: 0.0 for e in range(64)} for t in range(16)} 
+
+for prompt in prompts:
+
+  messages = [{"role": "user", "content": prompt}]
+
+  inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+
+
+  routing_scores = RoutingScoreCapturer(model)
+
+  final_results = routing_scores.capture_routing_scores(inputs)
+
+
+
+  importance_scores_all = {}
+
+  for t in range(16):
+
+    average_routing_scores = {}
+
+    routing_score, activation_counts = final_results[t]
+
+    routing_score_combined = [list(pair) for pair in zip(*routing_score)]
+
+    for expert, routing_scores in enumerate(routing_score_combined):
+
+      average_routing_scores[expert] = sum(routing_scores) / len(routing_scores)
+
+
+
+    importance_scores = {}
+
+    for expert, _ in enumerate(activation_counts):
+
+      activation_frequency = activation_counts[expert] / sum(activation_counts) # Normalize
+
+      avg_routing_score = average_routing_scores[expert]
+
+      importance_scores[expert] = (activation_frequency ** alpha) * (avg_routing_score ** beta)
+
+    importance_scores_all[t] = importance_scores
+
+  
+
+  for t in range(16):
+
+    for e in range(64):
+
+      avg_importance_scores[t][e] += importance_scores_all[t][e]
+
+
+
+# just so I don't use these instead of avg_importance_score by accident
+
+importance_scores = None
+
+importance_scores_all = None
+
+
+
+for t in range(16):
+
+  for e in range(64):
+
+    avg_importance_scores[t][e] /= len(prompts)
+
+
+
+
+
+selected_list = [3,6]
+
+for t in range(16):
+
+  most_important_experts = {}
+
+  top_8_most_important_expert = sorted(range(len(avg_importance_scores)), key=lambda i: avg_importance_scores[t][i], reverse=True)[:8]
+
+  most_important_experts[t] = top_8_most_important_expert
+
+  if t in selected_list:
+
+    print("layer", t)
+
+    print("selected:", top_8_most_important_expert)
+
+    print()
+
+    model.model.layers[t].mlp.selected_experts = top_8_most_important_expert
+
+
+
+
+
+# print(importance_scores_all)
+
+# print(most_important_experts)
+
+
+
+# def retain_top_experts(model, most_important_experts):
+
+
+
+#  for layer_idx, layer in enumerate(model.model.layers):
+
+#    moe_block = layer.mlp
+
+#    top_expert_indices = most_important_experts[layer_idx]
+
+
+
+#    selected_experts = nn.ModuleList([moe_block.experts[i] for i in top_expert_indices])
+
+#    moe_block.experts = selected_experts
+
+    # moe_block.gate = nn.Linear(moe_block.gate.in_features, 64, bias=False)
+
+    # new_gate = nn.Linear(moe_block.gate.in_features, 64, bias=False)
+
+    
+
+    # # Copy the selected weights from the original gate
+
+    # with torch.no_grad():
+
+    #  new_gate.weight.copy_(moe_block.gate.weight[top_expert_indices])
+
+    
+
+    # # Replace the original gate layer with the modified one
+
+    # moe_block.gate = new_gate
+
+# model = OlmoeForCausalLM.from_pretrained("moe-OLMoE").to(DEVICE)
+
+# retain_top_experts(model, most_important_experts)
+
+# print(model)
+
+# exit()
+
+# for layer_idx, layer in enumerate(model.model.layers):
+
+#  moe_block = layer.mlp
+
+#  print(moe_block.experts)
+
+
+
+# inputs = tokenizer("Write python to print hi.", return_tensors="pt").to(DEVICE)
+
+# with torch.no_grad():
+
+#  out = model.generate(**inputs, max_length=128)
+
+# print("small_model>>>", tokenizer.decode(out[0]))
+
+
+
+messages = [{"role": "user", "content": "Use Python to calculate 5+5. \n Only give me the codes. Don't add any other explanations."}]
+
+inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+out = model.generate(inputs, max_length=512)
+
+print(model)
+
+print("small_model>>>", tokenizer.decode(out[0]))
+
+
+
+messages = [{"role": "user", "content": "Use python to solve the coding problem below:\n Given an array of integers nums and an integer target, return indices of the two numbers such that they add up to target. You may assume that each input would have exactly one solution, and you may not use the same element twice. You can return the answer in any order. \n Only give me the codes. Don't add any other explanations."}]
+
+inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+out = model.generate(inputs, max_length=512)
+
+
+
+print("small_model>>>", tokenizer.decode(out[0]))
+
+
+
+messages = [{"role": "user", "content": "Write a Python function to calculate the sum of two numbers. \n Only give me the codes. Don't add any other explanations."}]
+
+inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+out = model.generate(inputs, max_length=512)
+
+
+
+print("small_model>>>", tokenizer.decode(out[0]))
+
+
+
+messages = [{"role": "user", "content": "Write a Python class which can save numbers and get numbers. \n Only give me the codes. Don't add any other explanations."}]
+
+inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+out = model.generate(inputs, max_length=512)
+
+
+
+print("small_model>>>", tokenizer.decode(out[0]))
+
+
+
+messages = [{"role": "user", "content": "Implement merge sort in Python \n Only give me the codes. Don't add any other explanations."}]
+
+inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+out = model.generate(inputs, max_length=512)
+
+
+
+print("small_model>>>", tokenizer.decode(out[0]))
+
+while True:
+
+  r = model.generate(inputs, max_length=512)
+
+  print("Answer:")
+
+  print(r)
+
+  print()
+
+  question = input('Question: ')
+
+  messages = [{"role": "user", "content": question}]
+
+  inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(DEVICE)
+
+
+
+
+
+'''human eval
+
+from transformers import OlmoeForCausalLM, AutoTokenizer
+
+import torch
+
+
+
+DEVICE = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+
+
+def generate_one_completion(prompt):
+
+  print("===== PROMPT =====\n", prompt)
+
+  inputs = tokenizer(prompt, return_tensors="pt")
+
+  with torch.no_grad():
+
+    out = model.generate(**inputs, max_length=512)
+
+  answer = tokenizer.decode(out[0], skip_special_tokens=True)
+
+  print("===== ANSWER =====\n", answer)
+
+  return answer
+
+
+
+
+
+from human_eval.data import write_jsonl, read_problems
+
+
+
+problems = read_problems()
+
+to_attempt = ['HumanEval/0', 'HumanEval/1', 'HumanEval/2', 'HumanEval/3', 'HumanEval/4']
+
+
+
+num_samples_per_task = 1 #200
+
+samples = [
+
+  #dict(task_id=task_id, completion="" if task_id not in to_attempt else generate_one_completion(problems[task_id]["prompt"]))
+
+  dict(task_id=task_id, completion= generate_one_completion(problems[task_id]["prompt"]))
+
+  for task_id in problems
+
+  for _ in range(num_samples_per_task)
+
+]
+
+write_jsonl("samples_pruned_model.jsonl", samples)
+
+'''
+
+
+
